@@ -8,9 +8,9 @@ use std::fs;
 
 pub mod components;
 pub mod physics;
+mod scripts;
 
 use crate::components::*;
-use crate::physics::*;
 
 fn main() {
     App::new()
@@ -27,12 +27,13 @@ fn main() {
         .insert_resource(DragState::default())
         .insert_resource(Config {
             k_r: 5000.,
-            k_w: 0.1,
             k_g: 0.2,
             enabled: true,
         })
         .insert_resource(Selected(None))
         .insert_resource(Graph::default())
+        .insert_resource(EdgeCreation::default())
+        .insert_resource(DeletionRequest::default())
         .add_systems(Startup, (load_edge_list,).chain())
         .add_systems(
             Update,
@@ -43,9 +44,12 @@ fn main() {
                 drag_nodes,
                 draw_nodes,
                 create_node.run_if(in_state(AppMode::Edit)),
+                create_edge.run_if(in_state(AppMode::Edit)),
+                draw_edge_preview.run_if(in_state(AppMode::Edit)),
+                detect_right_clicks.run_if(in_state(AppMode::Edit)),
             ),
         )
-        .add_systems(EguiPrimaryContextPass, (ui_system,))
+        .add_systems(EguiPrimaryContextPass, (ui_system, deletion_popup.run_if(in_state(AppMode::Edit))))
         .run();
 }
 
@@ -63,7 +67,7 @@ fn compute_degrees(edge_query: &Query<&GEdge>) -> HashMap<Entity, usize> {
 fn drag_nodes(
     mut drag: ResMut<DragState>,
     mut camera: Query<(&Camera, &GlobalTransform, &mut PanCam)>,
-    mut nodes: Query<(Entity, &mut Transform, &Node)>,
+    mut nodes: Query<(Entity, &mut Transform, &GNode)>,
     mouse_input: Res<ButtonInput<MouseButton>>,
     mut world_pos: Local<Vec2>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -85,7 +89,6 @@ fn drag_nodes(
 
     // start drag
     if mouse_input.just_pressed(MouseButton::Left) && drag.dragging.is_none() {
-        eprintln!("GI");
         let mut on = false;
         for (ent, tf, _) in nodes.iter() {
             let dist = (tf.translation.truncate() - *world_pos).length();
@@ -118,7 +121,6 @@ fn drag_nodes(
 
     // release drag
     if mouse_input.just_released(MouseButton::Left) {
-        eprintln!("UM?");
         camera.2.enabled = true;
         drag.dragging = None;
     }
@@ -127,6 +129,7 @@ fn drag_nodes(
 
 fn create_node(
     mut camera: Query<(&Camera, &GlobalTransform)>,
+    nodes: Query<(Entity, &Transform, &GNode)>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut graph: ResMut<Graph>,
     egui_ctx: EguiContexts,
@@ -143,7 +146,7 @@ fn create_node(
     if !mouse_input.just_pressed(MouseButton::Left) {
         return Ok(());
     }
-    let mut camera = camera.single_mut().unwrap();
+    let camera = camera.single_mut().unwrap();
     let window = window.single().unwrap();
     if let Some(world_position) = window
         .cursor_position()
@@ -151,6 +154,16 @@ fn create_node(
         .map(|ray| ray.origin.truncate())
     {
         *world_pos = world_position;
+    }
+    let mut on = false;
+    for (ent, tf, _) in nodes.iter() {
+        let dist = (tf.translation.truncate() - *world_pos).length();
+        if dist < 60.0 {
+            on = true;
+        }
+    }
+    if on {
+        return Ok(());
     }
 
     let font = asset_server.load("fonts/FiraMono-Regular.ttf");
@@ -172,6 +185,110 @@ fn create_node(
         ))
         .id();
     graph.adj.insert(id, Vec::new());
+    Ok(())
+}
+
+fn create_edge(
+    mut commands: Commands,
+    mut edge_state: ResMut<EdgeCreation>,
+    nodes: Query<(Entity, &Transform), With<GNode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) -> Result {
+    if !mouse.just_pressed(MouseButton::Left) { return Ok(()); }
+
+    let (camera, camera_tf) = camera.single()?;
+    let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
+    let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
+        .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+
+    // Did we click on a node?
+    let clicked_node = nodes.iter()
+        .find(|(_, tf)| (tf.translation.truncate() - world_pos).length() < 60.0)
+        .map(|(e, _)| e);
+
+    if let Some(node) = clicked_node {
+        match edge_state.from {
+            None => {
+                // first click — start new edge
+                edge_state.from = Some(node);
+            }
+            Some(from) if from != node => {
+                // second click — finalize edge
+                let edge = commands.spawn((
+                    GEdge { from, to: node },
+                    Mesh2d(meshes.add(Rectangle::new(0., 0.))),
+                    MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(RED)))),
+                    Transform::default(),
+                    GlobalTransform::default(),
+                )).id();
+                commands.entity(edge_state.temp_line.unwrap()).despawn();
+                edge_state.from = None;
+                edge_state.temp_line = None;
+            }
+            _ => {
+                // clicked the same node again → cancel
+                edge_state.from = None;
+            }
+        }
+    } else {
+        // clicked empty space — cancel
+        edge_state.from = None;
+    }
+    Ok(())
+}
+
+fn draw_edge_preview(
+    mut edge_state: ResMut<EdgeCreation>,
+    mut commands: Commands,
+    nodes: Query<&Transform, With<GNode>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut temp_query: Query<(&mut Transform, &mut Mesh2d), Without<GNode>>,
+) -> Result {
+    if let Some(from) = edge_state.from {
+        let (camera, camera_tf) = camera.single()?;
+        let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
+        let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
+            .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+
+        let from_pos = nodes.get(from).ok().map(|t| t.translation.truncate());
+        if let Some(start) = from_pos {
+            let direction = world_pos - start;
+            let length = direction.length();
+            let angle = direction.y.atan2(direction.x);
+
+            // If temp line doesn’t exist, create it
+            let temp_line = edge_state.temp_line.get_or_insert_with(|| {
+                commands.spawn((
+                    Mesh2d(meshes.add(Rectangle::new(length, 2.))),
+                    MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(GRAY)))),
+                    Transform::from_translation(Vec3::new(
+                        (start.x + world_pos.x) / 2.0,
+                        (start.y + world_pos.y) / 2.0,
+                        0.0,
+                    ))
+                        .with_rotation(Quat::from_rotation_z(angle)),
+                    GlobalTransform::default(),
+                )).id()
+            });
+
+            // Update existing line
+            if let Ok((mut tf, mut mesh2d)) = temp_query.get_mut(*temp_line) {
+                tf.translation = Vec3::new((start.x + world_pos.x) / 2.0, (start.y + world_pos.y) / 2.0, 0.0);
+                tf.rotation = Quat::from_rotation_z(angle);
+                *mesh2d = Mesh2d(meshes.add(Rectangle::new(length, 2.)));
+            }
+        }
+    } else if let Some(temp_line) = edge_state.temp_line.take() {
+        // Remove preview line if cancelled
+        commands.entity(temp_line).despawn();
+    }
     Ok(())
 }
 
@@ -248,7 +365,6 @@ fn load_edge_list(
                 GEdge {
                     from: from_ent,
                     to: to_ent,
-                    weight: parts.get(2).and_then(|s| s.parse().ok()),
                 },
                 Mesh2d(meshes.add(Rectangle::new(0., 0.))),
                 MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(RED)))),
@@ -278,7 +394,7 @@ fn draw_edges(
 
             let mesh = meshes.add(Mesh::from(Rectangle::new(
                 length,
-                edge.weight.unwrap_or(2.),
+                2.
             )));
             *mesh2d = Mesh2d(mesh);
             *transform = Transform {
@@ -305,6 +421,145 @@ fn draw_nodes(
     }
 }
 
+fn detect_right_clicks(
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    nodes: Query<(Entity, &Transform), With<GNode>>,
+    edges: Query<(Entity, &GEdge, &Transform)>,
+    mut deletion: ResMut<DeletionRequest>,
+) -> Result {
+    if !mouse.just_pressed(MouseButton::Right) { return Ok(()); }
+
+    let (camera, camera_tf) = camera.single()?;
+    let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
+    let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
+        .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+
+    // 1️⃣ Check nodes first
+    for (ent, tf) in nodes.iter() {
+        if (tf.translation.truncate() - world_pos).length() < 60.0 {
+            deletion.node = Some(ent);
+            return Ok(()); // found a node
+        }
+    }
+
+    // 2️⃣ Otherwise check edges (approximate with distance to line)
+    for (ent, edge, _) in edges.iter() {
+        if let (Ok(from_tf), Ok(to_tf)) = (nodes.get(edge.from), nodes.get(edge.to)) {
+            let a = from_tf.1.translation.truncate();
+            let b = to_tf.1.translation.truncate();
+            if point_near_segment(a, b, world_pos, 5.0) {
+                deletion.edge = Some(ent);
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+fn point_near_segment(a: Vec2, b: Vec2, p: Vec2, tolerance: f32) -> bool {
+    let ab = b - a;
+    let ap = p - a;
+    let t = (ap.dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+    let closest = a + t * ab;
+    p.distance(closest) < tolerance
+}
+fn deletion_popup(
+    mut egui_ctx: EguiContexts,
+    mut deletion: ResMut<DeletionRequest>,
+    mut commands: Commands,
+    mut graph: ResMut<Graph>,
+    edges: Query<(Entity, &GEdge)>,
+) -> Result {
+    if let Some(node_ent) = deletion.node {
+        egui::Window::new("Delete Node?")
+            .collapsible(false)
+            .show(egui_ctx.ctx_mut()?, |ui| {
+                ui.label("Delete this node and all connected edges?");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        deletion.node = None;
+                    }
+                    if ui.button("Delete").clicked() {
+                        // remove all edges linked to this node
+                        delete_node(deletion.node.unwrap(), &mut graph, &mut commands, &edges);
+                        deletion.node = None;
+                    }
+                });
+            });
+    }
+
+    if let Some(edge_ent) = deletion.edge {
+        egui::Window::new("Delete Edge?")
+            .collapsible(false)
+            .show(egui_ctx.ctx_mut()?, |ui| {
+                ui.label("Delete this edge?");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        deletion.edge = None;
+                    }
+                    if ui.button("Delete").clicked() {
+                        delete_edge(deletion.edge.unwrap(), &mut graph, &mut commands, &edges);
+                        deletion.edge = None;
+                    }
+                });
+            });
+    }
+
+    Ok(())
+}
+fn delete_node(
+    node: Entity,
+    graph: &mut Graph,
+    commands: &mut Commands,
+    edge_query: &Query<(Entity, &GEdge)>,
+) {
+    // 1. Collect all edges connected to this node
+    let edges_to_remove: Vec<_> = edge_query
+        .iter()
+        .filter(|(_, e)| e.from == node || e.to == node)
+        .map(|(ent, _)| ent)
+        .collect();
+
+    // 2. Despawn those edges
+    for edge_ent in &edges_to_remove {
+        commands.entity(*edge_ent).despawn();
+        graph.edges.retain(|&e| e != *edge_ent);
+    }
+
+    // 3. Remove node from adjacency list
+    graph.adj.remove(&node);
+
+    // 4. Remove node from other adjacency lists
+    for neighbors in graph.adj.values_mut() {
+        neighbors.retain(|&n| n != node);
+    }
+
+    // 5. Despawn node itself
+    commands.entity(node).despawn();
+}
+
+fn delete_edge(
+    edge_ent: Entity,
+    graph: &mut Graph,
+    commands: &mut Commands,
+    edge_query: &Query<(Entity, &GEdge)>,
+) {
+    if let Ok((_, edge)) = edge_query.get(edge_ent) {
+        // Remove from adjacency list
+        if let Some(neighbors) = graph.adj.get_mut(&edge.from) {
+            neighbors.retain(|&n| n != edge.to);
+        }
+
+        // Remove edge record
+        graph.edges.retain(|&e| e != edge_ent);
+
+        // Despawn edge
+        commands.entity(edge_ent).despawn();
+    }
+}
+
 fn ui_system(
     mut egui_ctx: EguiContexts,
     mut config: ResMut<Config>,
@@ -324,7 +579,6 @@ fn ui_system(
     egui::Window::new("Physics settings").show(egui_ctx.ctx_mut()?, |ui| {
         ui.checkbox(&mut config.enabled, "Enable physics");
         ui.add(egui::Slider::new(&mut config.k_r, 0.0..=10000.0).text("Repulsion force"));
-        ui.add(egui::Slider::new(&mut config.k_w, 0.0..=1.0).text("The weight of weights"));
         ui.add(egui::Slider::new(&mut config.k_g, 0.0..=4.0).text("Gravity force"));
     });
     Ok(())

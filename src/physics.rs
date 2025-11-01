@@ -26,7 +26,6 @@ pub(crate) fn apply_forces(
         }
     }
     let k_r = config.k_r;
-    let k_w = config.k_w;
     let k_g = config.k_g;
     let k_s = 0.1;
     let mut global_swinging = 0.0;
@@ -43,13 +42,9 @@ pub(crate) fn apply_forces(
     for GEdge {
         to: ent1,
         from: ent2,
-        weight,
     } in edge_query.iter()
     {
         let mut delta = positions[&ent2] - positions[&ent1];
-        if let Some(w) = weight {
-            delta *= w.powf(k_w);
-        }
         *a_forces.entry(ent1).or_insert(Vec2::ZERO) -= delta;
         *a_forces.entry(ent2).or_insert(Vec2::ZERO) += delta;
     }
