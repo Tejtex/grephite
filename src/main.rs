@@ -1,3 +1,4 @@
+use bevy::a11y::ManageAccessibilityUpdates;
 use bevy::window::PrimaryWindow;
 use bevy::{color::palettes::css::*, prelude::*};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
@@ -11,6 +12,7 @@ pub mod physics;
 mod scripts;
 
 use crate::components::*;
+use crate::scripts::*;
 
 fn main() {
     App::new()
@@ -29,11 +31,19 @@ fn main() {
             k_r: 5000.,
             k_g: 0.2,
             enabled: true,
+            scripts_dir: "scripts".to_string(),
         })
         .insert_resource(Selected(None))
         .insert_resource(Graph::default())
         .insert_resource(EdgeCreation::default())
         .insert_resource(DeletionRequest::default())
+        .insert_resource(NodeColors {
+            colors: HashMap::new(),
+        })
+        .insert_resource(LuaManager::default())
+        .add_message::<ScriptCommand>()
+        .add_message::<StepLua>()
+        .add_message::<ExecLuaScript>()
         .add_systems(Startup, (load_edge_list,).chain())
         .add_systems(
             Update,
@@ -47,9 +57,21 @@ fn main() {
                 create_edge.run_if(in_state(AppMode::Edit)),
                 draw_edge_preview.run_if(in_state(AppMode::Edit)),
                 detect_right_clicks.run_if(in_state(AppMode::Edit)),
+                spawn_lua_scripts,
+                run_lua_scripts,
+                flush_lua_events,
+                exec_lua_events,
+                auto_run,
             ),
         )
-        .add_systems(EguiPrimaryContextPass, (ui_system, deletion_popup.run_if(in_state(AppMode::Edit))))
+        .add_systems(
+            EguiPrimaryContextPass,
+            (
+                ui_system,
+                deletion_popup.run_if(in_state(AppMode::Edit)),
+                script_ui.run_if(in_state(AppMode::Script)),
+            ),
+        )
         .run();
 }
 
@@ -99,7 +121,7 @@ fn drag_nodes(
                 camera.2.enabled = false;
                 drag.offset = tf.translation.truncate() - *world_pos;
                 if selected.0 == None {
-                    selected.0 = Some(ent)
+                    selected.0 = Some(ent);
                 } else {
                     selected.0 = None;
                 }
@@ -139,6 +161,7 @@ fn create_node(
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
     mouse_input: Res<ButtonInput<MouseButton>>,
+    mut colors: ResMut<NodeColors>,
 ) -> Result {
     if egui_ctx.ctx()?.wants_pointer_input() {
         return Ok(());
@@ -185,6 +208,7 @@ fn create_node(
         ))
         .id();
     graph.adj.insert(id, Vec::new());
+    colors.colors.insert(id, Color::from(BLACK));
     Ok(())
 }
 
@@ -197,16 +221,27 @@ fn create_edge(
     camera: Query<(&Camera, &GlobalTransform)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut graph: ResMut<Graph>,
 ) -> Result {
-    if !mouse.just_pressed(MouseButton::Left) { return Ok(()); }
+    if !mouse.just_pressed(MouseButton::Left) {
+        return Ok(());
+    }
 
     let (camera, camera_tf) = camera.single()?;
-    let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
-    let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
-        .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+    let Some(cursor) = window.single()?.cursor_position() else {
+        return Ok(());
+    };
+    let Some(world_pos) = camera
+        .viewport_to_world(camera_tf, cursor)
+        .ok()
+        .map(|ray| ray.origin.truncate())
+    else {
+        return Ok(());
+    };
 
     // Did we click on a node?
-    let clicked_node = nodes.iter()
+    let clicked_node = nodes
+        .iter()
         .find(|(_, tf)| (tf.translation.truncate() - world_pos).length() < 60.0)
         .map(|(e, _)| e);
 
@@ -218,13 +253,17 @@ fn create_edge(
             }
             Some(from) if from != node => {
                 // second click — finalize edge
-                let edge = commands.spawn((
-                    GEdge { from, to: node },
-                    Mesh2d(meshes.add(Rectangle::new(0., 0.))),
-                    MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(RED)))),
-                    Transform::default(),
-                    GlobalTransform::default(),
-                )).id();
+                let edge = commands
+                    .spawn((
+                        GEdge { from, to: node },
+                        Mesh2d(meshes.add(Rectangle::new(0., 0.))),
+                        MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(RED)))),
+                        Transform::default(),
+                        GlobalTransform::default(),
+                    ))
+                    .id();
+                graph.adj.entry(from).or_insert(Vec::new()).push(node);
+                graph.adj.entry(node).or_insert(Vec::new()).push(from);
                 commands.entity(edge_state.temp_line.unwrap()).despawn();
                 edge_state.from = None;
                 edge_state.temp_line = None;
@@ -253,9 +292,16 @@ fn draw_edge_preview(
 ) -> Result {
     if let Some(from) = edge_state.from {
         let (camera, camera_tf) = camera.single()?;
-        let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
-        let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
-            .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+        let Some(cursor) = window.single()?.cursor_position() else {
+            return Ok(());
+        };
+        let Some(world_pos) = camera
+            .viewport_to_world(camera_tf, cursor)
+            .ok()
+            .map(|ray| ray.origin.truncate())
+        else {
+            return Ok(());
+        };
 
         let from_pos = nodes.get(from).ok().map(|t| t.translation.truncate());
         if let Some(start) = from_pos {
@@ -265,22 +311,28 @@ fn draw_edge_preview(
 
             // If temp line doesn’t exist, create it
             let temp_line = edge_state.temp_line.get_or_insert_with(|| {
-                commands.spawn((
-                    Mesh2d(meshes.add(Rectangle::new(length, 2.))),
-                    MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(GRAY)))),
-                    Transform::from_translation(Vec3::new(
-                        (start.x + world_pos.x) / 2.0,
-                        (start.y + world_pos.y) / 2.0,
-                        0.0,
-                    ))
+                commands
+                    .spawn((
+                        Mesh2d(meshes.add(Rectangle::new(length, 2.))),
+                        MeshMaterial2d(materials.add(ColorMaterial::from(Color::from(GRAY)))),
+                        Transform::from_translation(Vec3::new(
+                            (start.x + world_pos.x) / 2.0,
+                            (start.y + world_pos.y) / 2.0,
+                            0.0,
+                        ))
                         .with_rotation(Quat::from_rotation_z(angle)),
-                    GlobalTransform::default(),
-                )).id()
+                        GlobalTransform::default(),
+                    ))
+                    .id()
             });
 
             // Update existing line
             if let Ok((mut tf, mut mesh2d)) = temp_query.get_mut(*temp_line) {
-                tf.translation = Vec3::new((start.x + world_pos.x) / 2.0, (start.y + world_pos.y) / 2.0, 0.0);
+                tf.translation = Vec3::new(
+                    (start.x + world_pos.x) / 2.0,
+                    (start.y + world_pos.y) / 2.0,
+                    0.0,
+                );
                 tf.rotation = Quat::from_rotation_z(angle);
                 *mesh2d = Mesh2d(meshes.add(Rectangle::new(length, 2.)));
             }
@@ -298,6 +350,7 @@ fn load_edge_list(
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
     mut graph: ResMut<Graph>,
+    mut colors: ResMut<NodeColors>,
 ) -> Result {
     let content = fs::read_to_string("graph.edges").expect("Unable to read file");
     let mut node_map: HashMap<usize, Entity> = HashMap::new();
@@ -360,6 +413,7 @@ fn load_edge_list(
             ent
         });
         graph.adj.entry(from_ent).or_insert(Vec::new()).push(to_ent);
+        graph.adj.entry(to_ent).or_insert(Vec::new()).push(from_ent);
         let ent = commands
             .spawn((
                 GEdge {
@@ -373,6 +427,8 @@ fn load_edge_list(
             ))
             .id();
         graph.edges.push(ent);
+        colors.colors.insert(to_ent, Color::from(BLACK));
+        colors.colors.insert(from_ent, Color::from(BLACK));
     }
     Ok(())
 }
@@ -392,10 +448,7 @@ fn draw_edges(
             let length = direction.length();
             let angle = direction.y.atan2(direction.x);
 
-            let mesh = meshes.add(Mesh::from(Rectangle::new(
-                length,
-                2.
-            )));
+            let mesh = meshes.add(Mesh::from(Rectangle::new(length, 2.)));
             *mesh2d = Mesh2d(mesh);
             *transform = Transform {
                 translation: Vec3::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0, 0.0),
@@ -407,16 +460,19 @@ fn draw_edges(
 }
 
 fn draw_nodes(
-    mut query_nodes: Query<(Entity, &mut MeshMaterial2d<ColorMaterial>), With<Node>>,
+    mut query_nodes: Query<(Entity, &mut MeshMaterial2d<ColorMaterial>), With<GNode>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     selected: Res<Selected>,
+    colors: Res<NodeColors>,
 ) {
     // Reset all nodes to BLACK
     for (entity, mut mat) in query_nodes.iter_mut() {
         if Some(entity) == selected.0 {
             *mat = MeshMaterial2d(materials.add(Color::from(RED)));
         } else {
-            *mat = MeshMaterial2d(materials.add(Color::from(BLACK)));
+            *mat = MeshMaterial2d(
+                materials.add(*colors.colors.get(&entity).unwrap_or(&Color::from(BLACK))),
+            );
         }
     }
 }
@@ -429,12 +485,21 @@ fn detect_right_clicks(
     edges: Query<(Entity, &GEdge, &Transform)>,
     mut deletion: ResMut<DeletionRequest>,
 ) -> Result {
-    if !mouse.just_pressed(MouseButton::Right) { return Ok(()); }
+    if !mouse.just_pressed(MouseButton::Right) {
+        return Ok(());
+    }
 
     let (camera, camera_tf) = camera.single()?;
-    let Some(cursor) = window.single()?.cursor_position() else { return Ok(()); };
-    let Some(world_pos) = camera.viewport_to_world(camera_tf, cursor).ok()
-        .map(|ray| ray.origin.truncate()) else { return Ok(()); };
+    let Some(cursor) = window.single()?.cursor_position() else {
+        return Ok(());
+    };
+    let Some(world_pos) = camera
+        .viewport_to_world(camera_tf, cursor)
+        .ok()
+        .map(|ray| ray.origin.truncate())
+    else {
+        return Ok(());
+    };
 
     // 1️⃣ Check nodes first
     for (ent, tf) in nodes.iter() {
@@ -564,6 +629,9 @@ fn ui_system(
     mut egui_ctx: EguiContexts,
     mut config: ResMut<Config>,
     mut next_state: ResMut<NextState<AppMode>>,
+    mut writer: MessageWriter<ExecLuaScript>,
+    mut writer2: MessageWriter<StepLua>,
+    manager: Res<LuaManager>,
 ) -> Result {
     egui::Window::new("Mode").show(egui_ctx.ctx_mut()?, |ui| {
         if ui.button("View").clicked() {
@@ -581,8 +649,56 @@ fn ui_system(
         ui.add(egui::Slider::new(&mut config.k_r, 0.0..=10000.0).text("Repulsion force"));
         ui.add(egui::Slider::new(&mut config.k_g, 0.0..=4.0).text("Gravity force"));
     });
+
     Ok(())
 }
+
+fn script_ui(
+    mut egui_ctx: EguiContexts,
+    mut next_state: ResMut<NextState<AppMode>>,
+    mut writer: MessageWriter<ExecLuaScript>,
+    mut writer2: MessageWriter<StepLua>,
+    mut manager: ResMut<LuaManager>,
+    config: ResMut<Config>,
+) -> Result {
+    egui::Window::new("Available Scripts").show(egui_ctx.ctx_mut()?, |ui| {
+        // 1. wczytujemy wszystkie pliki Lua z katalogu
+        if let Ok(entries) = fs::read_dir(&config.scripts_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".lua") {
+                        if ui.button(name).clicked() {
+                            // 2. kliknięcie ładuje skrypt
+                            if let Ok(code) = fs::read_to_string(&path) {
+                                writer.write(ExecLuaScript { code });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Sterowanie skryptem
+        if let Some(active) = &mut manager.active_script {
+            ui.horizontal(|ui| {
+                if ui.button("Step").clicked() {
+                    writer2.write(StepLua);
+                }
+
+                let start_pause_label = if active.running { "Pause" } else { "Start" };
+                if ui.button(start_pause_label).clicked() {
+                    active.running = !active.running;
+                }
+
+                ui.add(egui::Slider::new(&mut active.speed, 1.0..=100.0).text("Steps/s"));
+            });
+        };
+    });
+
+    Ok(())
+}
+
 fn pan_camera_system(
     mut pan: Query<&mut PanCam>,
     drag: Res<DragState>,
